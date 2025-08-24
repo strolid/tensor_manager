@@ -137,8 +137,8 @@ async def create_tensor_from_array(payload: TensorArrayPayload):
         cp.cuda.Device(payload.cuda_device).use()
         cp_arr = cp.asarray(np_array, dtype=cp.float32)
         
-        # Convert to PyTorch tensor and keep on GPU
-        torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr.toDlpack())
+        # Convert to PyTorch tensor using modern DLPack protocol (no toDlpack())
+        torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr)
         
         # Create shared memory identifier using data pointer
         data_ptr = int(torch_tensor.data_ptr())
