@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pytest
-httpx
-numpy
-soundfile
-numpy==2.0.1
