@@ -1,18 +1,21 @@
-import uuid
+import base64
 import logging
+import mmap
+import os
+import tempfile
+import traceback
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import cupy as cp
+import numpy as np
 import torch
 import torchaudio
-import numpy as np
-import cupy as cp
-import base64
-from pathlib import Path
-from typing import Dict, Any, Optional, List
+import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import tempfile
-import os
-import mmap
 
 logger = logging.getLogger("tensor_manager")
 app = FastAPI(title="GPU Tensor Server", version="1.0.0")
@@ -64,8 +67,7 @@ async def create_tensor(
             handle_bytes = handle_obj.tobytes()
         else:
             try:
-                import numpy as _np
-                handle_bytes = _np.asarray(handle_obj, dtype=_np.uint8).tobytes()
+                handle_bytes = np.asarray(handle_obj, dtype=np.uint8).tobytes()
             except Exception:
                 raise HTTPException(status_code=500, detail="Unsupported IPC handle type")
         if len(handle_bytes) < 64:
@@ -302,5 +304,4 @@ async def shutdown_event():
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=10070, access_log=False)

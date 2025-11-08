@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 
-import torch
 import base64
-import requests
-from typing import Optional, Any, Dict, List
-import cupy as cp
-import numpy as np
 import ctypes
 import mmap
+import os
+import tempfile
+from typing import Any, Dict, List, Optional
+
+import cupy as cp
+import numpy as np
+import requests
+import soundfile as sf
+import torch
+
 try:
     from cuda import cudart
 except Exception:
@@ -273,10 +278,6 @@ def example_usage():
     
     client = TensorClient()
     
-    import tempfile
-    import soundfile as sf
-    import numpy as np
-    
     sample_rate = 16000
     duration = 1.0
     frequency = 440
@@ -319,7 +320,6 @@ def example_usage():
         print(f"Error: {e}")
     
     finally:
-        import os
         try:
             os.unlink(wav_path)
         except:
