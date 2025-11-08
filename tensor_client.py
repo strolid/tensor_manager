@@ -12,6 +12,7 @@ import numpy as np
 import requests
 import soundfile as sf
 import torch
+from urllib.parse import urlparse
 
 try:
     from cuda import cudart
@@ -19,8 +20,24 @@ except Exception:
     cudart = None
 
 class TensorClient:
-    def __init__(self, server_url: str = "http://localhost:10070"):
-        self.server_url = server_url
+    def __init__(
+        self,
+        server_url: Optional[str] = None,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8003,
+    ):
+        self.host = host
+        self.port = port
+        if server_url is None:
+            self.server_url = f"http://{self.host}:{self.port}"
+        else:
+            self.server_url = server_url
+            parsed = urlparse(server_url)
+            if parsed.hostname:
+                self.host = parsed.hostname
+            if parsed.port:
+                self.port = parsed.port
     
     def get_tensor_handle(self, tensor_id: str) -> dict:
         response = requests.get(f"{self.server_url}/tensors/{tensor_id}/handle")

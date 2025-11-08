@@ -1,7 +1,8 @@
+import argparse
 import base64
 import logging
-import mmap
 import os
+import sys
 import tempfile
 import traceback
 import uuid
@@ -14,7 +15,6 @@ import torch
 import torchaudio
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger("tensor_manager")
@@ -303,5 +303,17 @@ async def shutdown_event():
 
 
 
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the tensor manager FastAPI server.")
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8003, help="Port to listen on (default: 8003)")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10070, access_log=False)
+    main(sys.argv[1:])
