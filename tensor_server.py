@@ -2,23 +2,23 @@ import argparse
 import base64
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import traceback
 import uuid
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+import torch
+import torchaudio
+import uvicorn
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
+
 try:
     import cupy as cp
 except Exception:  # pragma: no cover - cupy may be unavailable on CPU-only systems
     cp = None
-
-import numpy as np
-import torch
-import torchaudio
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
 
 logger = logging.getLogger("tensor_manager")
 app = FastAPI(title="GPU Tensor Server", version="1.0.0")
@@ -376,21 +376,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def ensure_uvicorn() -> "uvicorn":  # type: ignore[name-defined]
-    try:
-        import uvicorn  # type: ignore
-        return uvicorn
-    except ModuleNotFoundError:
-        logger.warning("uvicorn not found; attempting installation via pip")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "uvicorn[standard]"])
-        import uvicorn  # type: ignore
-        return uvicorn
-
-
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    uvicorn_mod = ensure_uvicorn()
-    uvicorn_mod.run(app, host=args.host, port=args.port, access_log=False)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=False)
 
 
 if __name__ == "__main__":
