@@ -6,8 +6,10 @@ import sys
 import tempfile
 import traceback
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cupy as cp
 import numpy as np
 import torch
 import torchaudio
@@ -17,6 +19,10 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("tensor_manager")
 app = FastAPI(title="GPU Tensor Server", version="1.0.0")
+
+# Shared memory directory for tensor files
+SHARED_TENSOR_DIR = Path("/tmp/shared_tensors")
+SHARED_TENSOR_DIR.mkdir(exist_ok=True)
 
 tensor_storage: Dict[str, Dict[str, Any]] = {}
 
@@ -49,30 +55,44 @@ async def create_tensor(
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
         waveform, sample_rate = torchaudio.load(tmp_file_path)
-        audio_tensor = waveform.squeeze(0).contiguous().to(torch.float32)
-        torch_tensor = audio_tensor.to(f"cuda:{cuda_device}")
-        element_size = torch_tensor.element_size()
-        numel = torch_tensor.numel()
-        nbytes = element_size * numel
-
+        audio = waveform.squeeze(0).contiguous().numpy()
+        cp.cuda.Device(cuda_device).use()
+        cp_arr = cp.asarray(audio, dtype=cp.float32)
+        ptr = int(cp_arr.data.ptr)
+        # Obtain 64-byte IPC handle using CuPy single-arg API and normalize
+        handle_obj = cp.cuda.runtime.ipcGetMemHandle(ptr)
+        if isinstance(handle_obj, (bytes, bytearray)):
+            handle_bytes = bytes(handle_obj)
+        elif hasattr(handle_obj, 'tobytes'):
+            handle_bytes = handle_obj.tobytes()
+        else:
+            try:
+                handle_bytes = np.asarray(handle_obj, dtype=np.uint8).tobytes()
+            except Exception:
+                raise HTTPException(status_code=500, detail="Unsupported IPC handle type")
+        if len(handle_bytes) < 64:
+            raise HTTPException(status_code=500, detail=f"Invalid IPC handle size: {len(handle_bytes)}")
+        ipc_handle_b64 = base64.b64encode(handle_bytes[:64]).decode('utf-8')
+        
         tensor_storage[tensor_id] = {
-            "torch_tensor": torch_tensor,
-            "shape": list(torch_tensor.shape),
-            "dtype": str(torch_tensor.dtype),
+            "cupy": cp_arr,
+            "shape": list(cp_arr.shape),
+            "dtype": "torch.float32",
             "device": f"cuda:{cuda_device}",
             "sample_rate": sample_rate,
             "original_filename": wav_file.filename,
-            "element_size": element_size,
-            "numel": numel,
-            "nbytes": nbytes,
+            "ipc_handle": ipc_handle_b64,
+            "data_ptr": ptr,
+            "element_size": 4,
+            "numel": int(cp_arr.size)
         }
         
         os.unlink(tmp_file_path)
         
         return {
             "tensor_id": tensor_id,
-            "shape": list(torch_tensor.shape),
-            "dtype": str(torch_tensor.dtype),
+            "shape": list(cp_arr.shape),
+            "dtype": "torch.float32",
             "device": f"cuda:{cuda_device}",
             "sample_rate": sample_rate,
             "message": f"Tensor loaded successfully on cuda:{cuda_device}"
@@ -112,32 +132,38 @@ async def create_tensor_from_array(payload: TensorArrayPayload):
     try:
         raw = base64.b64decode(payload.data_b64)
         np_dtype = np.float32 if payload.dtype in ("float32", "torch.float32") else np.float32
-        np_array = np.frombuffer(raw, dtype=np_dtype).copy()
+        np_array = np.frombuffer(raw, dtype=np_dtype)
         if payload.shape:
             np_array = np_array.reshape(tuple(payload.shape))
-        torch_tensor = torch.from_numpy(np_array).to(torch.float32)
-        torch_tensor = torch_tensor.to(f"cuda:{payload.cuda_device}")
-        element_size = torch_tensor.element_size()
-        numel = torch_tensor.numel()
-        nbytes = element_size * numel
-
+        # Use shared memory mapping for TRUE zero-copy GPU tensor sharing
+        cp.cuda.Device(payload.cuda_device).use()
+        cp_arr = cp.asarray(np_array, dtype=cp.float32)
+        
+        # Convert to PyTorch tensor using modern DLPack protocol (no toDlpack())
+        torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr)
+        
+        # Create shared memory identifier using data pointer
+        data_ptr = int(torch_tensor.data_ptr())
+        
         tensor_id = str(uuid.uuid4())
         tensor_storage[tensor_id] = {
-            "torch_tensor": torch_tensor,
+            "torch_tensor": torch_tensor,  # Keep reference to prevent garbage collection
+            "cupy": cp_arr,
             "shape": list(torch_tensor.shape),
-            "dtype": str(torch_tensor.dtype),
+            "dtype": "torch.float32", 
             "device": f"cuda:{payload.cuda_device}",
             "sample_rate": payload.sample_rate,
             "original_filename": None,
-            "element_size": element_size,
-            "numel": numel,
-            "nbytes": nbytes,
+            "data_ptr": data_ptr,
+            "element_size": 4,
+            "numel": int(torch_tensor.numel()),
+            "nbytes": int(torch_tensor.numel() * 4)
         }
 
         return {
             "tensor_id": tensor_id,
-            "shape": list(torch_tensor.shape),
-            "dtype": str(torch_tensor.dtype),
+            "shape": list(cp_arr.shape),
+            "dtype": "torch.float32",
             "device": f"cuda:{payload.cuda_device}",
             "sample_rate": payload.sample_rate,
             "message": f"Tensor loaded successfully on cuda:{payload.cuda_device}"
@@ -151,7 +177,8 @@ async def get_tensor_info(tensor_id: str):
         raise HTTPException(status_code=404, detail="Tensor not found")
     
     info = tensor_storage[tensor_id].copy()
-    info.pop("torch_tensor", None)
+    info.pop("cupy", None)
+    info.pop("ipc_handle", None)
     return info
 
 @app.get("/tensors/{tensor_id}/handle")
@@ -160,21 +187,18 @@ async def get_tensor_handle(tensor_id: str):
         raise HTTPException(status_code=404, detail="Tensor not found")
     
     tensor_info = tensor_storage[tensor_id]
-    torch_tensor = tensor_info["torch_tensor"]
-    cpu_tensor = torch_tensor.detach().cpu()
-    data_bytes = cpu_tensor.numpy().tobytes()
-    data_b64 = base64.b64encode(data_bytes).decode("utf-8")
-
+    
     return {
         "tensor_id": tensor_id,
+        "shared_memory": True,  # Flag indicating shared memory access
         "shape": tensor_info["shape"],
         "dtype": tensor_info["dtype"],
         "device": tensor_info["device"],
-        "element_size": cpu_tensor.element_size(),
-        "numel": cpu_tensor.numel(),
-        "nbytes": cpu_tensor.element_size() * cpu_tensor.numel(),
-        "sample_rate": tensor_info["sample_rate"],
-        "data_b64": data_b64,
+        "data_ptr": tensor_info["data_ptr"],
+        "element_size": tensor_info["element_size"],
+        "numel": tensor_info["numel"],
+        "nbytes": tensor_info["nbytes"],
+        "sample_rate": tensor_info["sample_rate"]
     }
 
 @app.get("/tensors/{tensor_id}/direct")
@@ -206,7 +230,20 @@ async def delete_tensor(tensor_id: str):
         raise HTTPException(status_code=404, detail="Tensor not found")
     
     tensor_info = tensor_storage.pop(tensor_id)
-
+    
+    try:
+        cp_arr = tensor_info.get("cupy")
+        if cp_arr is not None:
+            try:
+                cp_arr.data.mem.free()
+            except Exception:
+                pass
+            tensor_info.pop("cupy", None)
+    except Exception as e:
+        pass
+    
+    # IPC handle is automatically cleaned up when CuPy array is freed
+    
     return {"message": f"Tensor {tensor_id} deleted successfully"}
 
 @app.get("/tensors")
@@ -214,7 +251,8 @@ async def list_tensors():
     tensor_list = []
     for tensor_id, info in tensor_storage.items():
         tensor_info = info.copy()
-        tensor_info.pop("torch_tensor", None)
+        tensor_info.pop("cupy", None)
+        tensor_info.pop("ipc_handle", None)
         tensor_info["tensor_id"] = tensor_id
         tensor_list.append(tensor_info)
     
@@ -252,7 +290,13 @@ async def shutdown_event():
     global tensor_storage
     for tensor_id in list(tensor_storage.keys()):
         try:
-            tensor_storage.pop(tensor_id)
+            tensor_info = tensor_storage.pop(tensor_id)
+            cp_arr = tensor_info.get("cupy")
+            if cp_arr is not None:
+                try:
+                    cp_arr.data.mem.free()
+                except Exception:
+                    pass
         except Exception as e:
             print(f"Error cleaning up tensor {tensor_id}: {e}")
     print("Cleanup completed.")

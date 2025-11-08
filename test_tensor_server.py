@@ -1,4 +1,3 @@
-import base64
 import pytest
 import torch
 import numpy as np
@@ -128,13 +127,13 @@ class TestTensorServer:
         handle_response = client.get(f"/tensors/{tensor_id}/handle")
         assert handle_response.status_code == 200
         handle_result = handle_response.json()
-        assert "data_b64" in handle_result
+        assert "ipc_handle" in handle_result
+        assert "tensor_id" in handle_result
         assert handle_result["tensor_id"] == tensor_id
+        assert "data_ptr" in handle_result
         assert "element_size" in handle_result
         assert "numel" in handle_result
-        assert "nbytes" in handle_result
-        decoded = base64.b64decode(handle_result["data_b64"])
-        assert len(decoded) == handle_result["nbytes"]
+        assert isinstance(handle_result["ipc_handle"], str)
         
         list_response = client.get("/tensors")
         assert list_response.status_code == 200
@@ -218,10 +217,10 @@ class TestTensorServerIntegration:
         assert handle_response.status_code == 200
         handle_result = handle_response.json()
         
-        assert handle_result["data_b64"] is not None
+        assert handle_result["ipc_handle"] is not None
+        assert handle_result["data_ptr"] > 0
         assert handle_result["element_size"] > 0
         assert handle_result["numel"] > 0
-        assert handle_result["nbytes"] == handle_result["element_size"] * handle_result["numel"]
         assert len(handle_result["shape"]) == 1
         
         client.delete(f"/tensors/{tensor_id}")

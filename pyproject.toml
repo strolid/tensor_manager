@@ -11,6 +11,7 @@ python = ">=3.11,<3.15"
 torch = {version = "2.9.0+cu128", source = "torch-cu128"}
 torchvision = {version = "0.24.0+cu128", source = "torch-cu128"}
 torchaudio = {version = "2.9.0+cu128", source = "torch-cu128"}
+cuda-python = "^12.6.0"
 fastapi = "^0.121.0"
 uvicorn = {extras = ["standard"], version = "^0.38.0"}
 python-multipart = "^0.0.20"

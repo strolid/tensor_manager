@@ -70,14 +70,15 @@ def main():
         tensors_list = response.json()
         print(f"  Total tensors in memory: {tensors_list['count']}")
         
-        print("\n7. Getting tensor payload...")
+        print("\n7. Getting tensor IPC handle...")
         response = requests.get(f"{server_url}/tensors/{tensor_id}/handle")
         handle_data = response.json()
-        print(f"  Retrieved payload (first 50 chars): {handle_data['data_b64'][:50]}...")
+        print(f"  Retrieved IPC handle (first 50 chars): {handle_data['ipc_handle'][:50]}...")
+        print(f"  Data pointer: 0x{handle_data['data_ptr']:x}")
         print(f"  Element size: {handle_data['element_size']} bytes")
         print(f"  Number of elements: {handle_data['numel']}")
         print(f"  Tensor shape: {handle_data['shape']}")
-        print("  NOTE: The payload can be decoded to reconstruct the tensor in another process.")
+        print("  NOTE: This handle can be used by other processes to access the GPU tensor directly!")
         
         print("\n8. Deleting tensor...")
         response = requests.delete(f"{server_url}/tensors/{tensor_id}")
