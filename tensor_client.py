@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 
 import base64
-import ctypes
-import mmap
 import os
 import tempfile
 from typing import Any, Dict, List, Optional
 
-import cupy as cp
 import numpy as np
 import requests
 import soundfile as sf
 import torch
-
-try:
-    from cuda import cudart
-except Exception:
-    cudart = None
 
 class TensorClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 8003):
@@ -31,32 +23,13 @@ class TensorClient:
         return response.json()
     
     def access_shared_tensor(self, tensor_id: str) -> torch.Tensor:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available")
-
         handle_data = self.get_tensor_handle(tensor_id)
-        
-
-
         shape = tuple(handle_data['shape'])
-        dtype_str = handle_data['dtype']
+        dtype_str = handle_data.get('dtype', 'float32')
         device_str = handle_data.get('device', 'cuda:0')
-        data_ptr = int(handle_data['data_ptr'])
-        nbytes = int(handle_data['nbytes'])
-        
-
-        
-        # Select device
-        dev_index = 0
-        if isinstance(device_str, str) and device_str.startswith('cuda:'):
-            try:
-                dev_index = int(device_str.split(':', 1)[1])
-            except Exception:
-                dev_index = 0
-
-        # Initialize CUDA context
-        torch.cuda.set_device(dev_index)
-        cp.cuda.Device(dev_index).use()
+        data_b64 = handle_data.get('data_b64')
+        if not data_b64:
+            raise RuntimeError("Tensor handle is missing data payload")
 
         torch_dtype_map = {
             'torch.float32': torch.float32,
@@ -70,34 +43,32 @@ class TensorClient:
             'int64': torch.int64,
             'float16': torch.float16,
         }
-        cupy_dtype_map = {
-            'torch.float32': cp.float32,
-            'torch.float64': cp.float64,
-            'torch.int32': cp.int32,
-            'torch.int64': cp.int64,
-            'torch.float16': cp.float16,
-            'float32': cp.float32,
-            'float64': cp.float64,
-            'int32': cp.int32,
-            'int64': cp.int64,
-            'float16': cp.float16,
+        numpy_dtype_map = {
+            'torch.float32': np.float32,
+            'torch.float64': np.float64,
+            'torch.int32': np.int32,
+            'torch.int64': np.int64,
+            'torch.float16': np.float16,
+            'float32': np.float32,
+            'float64': np.float64,
+            'int32': np.int32,
+            'int64': np.int64,
+            'float16': np.float16,
         }
         t_dtype = torch_dtype_map.get(dtype_str, torch.float32)
-        cp_dtype = cupy_dtype_map.get(dtype_str, cp.float32)
+        np_dtype = numpy_dtype_map.get(dtype_str, np.float32)
 
-        # Create CuPy array from existing GPU memory pointer - ZERO COPY!
+        raw = base64.b64decode(data_b64)
+        np_array = np.frombuffer(raw, dtype=np_dtype).copy()
+        if shape:
+            np_array = np_array.reshape(shape)
 
-        
-        # Create unowned memory reference to existing GPU memory
-        unowned = cp.cuda.UnownedMemory(data_ptr, nbytes, None)
-        memptr = cp.cuda.MemoryPointer(unowned, 0)
-        cupy_arr = cp.ndarray(shape, dtype=cp_dtype, memptr=memptr)
+        tensor = torch.from_numpy(np_array).to(t_dtype)
 
-        # Zero-copy convert to torch via DLPack protocol (__dlpack__) - NO MEMORY COPY!
-        torch_tensor = torch.utils.dlpack.from_dlpack(cupy_arr)
-        
+        if isinstance(device_str, str) and device_str.startswith("cuda") and torch.cuda.is_available():
+            tensor = tensor.to(device_str)
 
-        return torch_tensor
+        return tensor
     
     def upload_wav_file(self, wav_file_path: str, cuda_device: int) -> str:
         with open(wav_file_path, 'rb') as f:
