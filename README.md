@@ -1,10 +1,11 @@
 # GPU Tensor Server
 
-A REST API server for managing GPU tensors across processes using **CUDA IPC (Inter-Process Communication)**. Loads WAV files as tensors on specific CUDA devices and shares them via memory handles - **tensors never leave the GPU**.
+A REST API server for managing GPU tensors across processes using **CUDA IPC (Inter-Process Communication)** when available, while gracefully falling back to CPU tensors when GPUs are not present.
 
 ## Key Features
 
-🚀 **Zero-Copy Sharing**: Tensors stay on GPU, only memory handles are shared  
+🚀 **Zero-Copy Sharing**: When CUDA is available tensors stay on GPU and are shared by handle  
+🧠 **CPU Fallback**: Runs even on CPU-only hosts by serialising tensors as base64 payloads  
 🎯 **CUDA IPC**: Uses PyTorch's CUDA IPC for true cross-process GPU memory sharing  
 🔒 **Device Control**: Force explicit CUDA device allocation  
 🆔 **Unique References**: UUID-based tensor IDs for reliable access  
@@ -55,12 +56,12 @@ Returns:
 curl http://localhost:8000/tensors/{tensor_id}
 ```
 
-#### 3. Get CUDA IPC handle (for accessing tensor)
+#### 3. Get tensor handle (IPC or base64 payload)
 ```bash
 curl http://localhost:8000/tensors/{tensor_id}/handle
 ```
 
-Returns IPC handle and metadata needed to access the GPU tensor:
+If CUDA is available you'll receive an IPC handle and metadata for zero-copy access:
 ```json
 {
   "tensor_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -69,6 +70,20 @@ Returns IPC handle and metadata needed to access the GPU tensor:
   "dtype": "torch.float32",
   "device": "cuda:0",
   "data_ptr": 140000000000000,
+  "element_size": 4,
+  "numel": 32000,
+  "sample_rate": 16000
+}
+```
+
+On CPU-only systems you'll instead receive a base64 payload that can be rebuilt client-side:
+```json
+{
+  "tensor_id": "550e8400-e29b-41d4-a716-446655440000",
+  "data_b64": "base64-encoded-tensor",
+  "shape": [32000],
+  "dtype": "torch.float32",
+  "device": "cpu",
   "element_size": 4,
   "numel": 32000,
   "sample_rate": 16000
@@ -102,11 +117,11 @@ client = TensorClient(host="localhost", port=8000)
 # Upload WAV file
 tensor_id = client.upload_wav_file("audio.wav", cuda_device=0)
 
-# Access the shared GPU tensor directly (zero-copy!)
+# Access the tensor (zero-copy on CUDA, decoded otherwise)
 shared_tensor = client.access_shared_tensor(tensor_id)
 
-# Tensor is on GPU and can be modified in-place
-shared_tensor.mul_(2.0)  # All processes see this change!
+# Tensor is moved to CUDA automatically if available
+shared_tensor.mul_(2.0)
 
 # Cleanup
 client.delete_tensor(tensor_id)
@@ -130,12 +145,9 @@ python tensor_client.py
 
 ## How It Works
 
-1. **Server loads WAV** → GPU tensor with `tensor.share_memory_()`
-2. **Client requests handle** → Server returns CUDA IPC handle (base64 encoded)
-3. **Client decodes handle** → Maps same GPU memory in client process
-4. **Direct GPU access** → Client can read/write tensor without copying data
-
-**Important**: The tensor data **never** moves off the GPU. Only memory handles are transmitted over HTTP.
+1. **Server loads WAV** → Tensor lives on GPU when CUDA+CuPy are available, otherwise on CPU.
+2. **Client requests handle** → Server returns a CUDA IPC handle or a base64 payload depending on the backend.
+3. **Client consumes handle** → Client performs zero-copy mapping on CUDA or reconstructs the CPU tensor from bytes.
 
 ## Features
 

@@ -6,10 +6,13 @@ import sys
 import tempfile
 import traceback
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import cupy as cp
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - cupy may be unavailable on CPU-only systems
+    cp = None
+
 import numpy as np
 import torch
 import torchaudio
@@ -19,10 +22,6 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("tensor_manager")
 app = FastAPI(title="GPU Tensor Server", version="1.0.0")
-
-# Shared memory directory for tensor files
-SHARED_TENSOR_DIR = Path("/tmp/shared_tensors")
-SHARED_TENSOR_DIR.mkdir(exist_ok=True)
 
 tensor_storage: Dict[str, Dict[str, Any]] = {}
 
@@ -38,15 +37,13 @@ async def create_tensor(
     if not wav_file.filename.endswith((".wav", ".WAV")):
         raise HTTPException(status_code=400, detail="Only WAV files are supported")
 
-    if not torch.cuda.is_available():
-        raise HTTPException(status_code=500, detail="CUDA is not available")
-    
-    if cuda_device >= torch.cuda.device_count() or cuda_device < 0:
+    using_cuda = torch.cuda.is_available() and cp is not None
+    if using_cuda and (cuda_device >= torch.cuda.device_count() or cuda_device < 0):
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Invalid CUDA device {cuda_device}. Available devices: 0-{torch.cuda.device_count()-1}"
         )
-    
+
     tensor_id = str(uuid.uuid4())
     
     try:
@@ -56,46 +53,70 @@ async def create_tensor(
             tmp_file_path = tmp_file.name
         waveform, sample_rate = torchaudio.load(tmp_file_path)
         audio = waveform.squeeze(0).contiguous().numpy()
-        cp.cuda.Device(cuda_device).use()
-        cp_arr = cp.asarray(audio, dtype=cp.float32)
-        ptr = int(cp_arr.data.ptr)
-        # Obtain 64-byte IPC handle using CuPy single-arg API and normalize
-        handle_obj = cp.cuda.runtime.ipcGetMemHandle(ptr)
-        if isinstance(handle_obj, (bytes, bytearray)):
-            handle_bytes = bytes(handle_obj)
-        elif hasattr(handle_obj, 'tobytes'):
-            handle_bytes = handle_obj.tobytes()
+
+        if using_cuda:
+            cp.cuda.Device(cuda_device).use()
+            cp_arr = cp.asarray(audio, dtype=cp.float32)
+            ptr = int(cp_arr.data.ptr)
+            handle_obj = cp.cuda.runtime.ipcGetMemHandle(ptr)
+            if isinstance(handle_obj, (bytes, bytearray)):
+                handle_bytes = bytes(handle_obj)
+            elif hasattr(handle_obj, "tobytes"):
+                handle_bytes = handle_obj.tobytes()
+            else:
+                try:
+                    handle_bytes = np.asarray(handle_obj, dtype=np.uint8).tobytes()
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Unsupported IPC handle type")
+            if len(handle_bytes) < 64:
+                raise HTTPException(status_code=500, detail=f"Invalid IPC handle size: {len(handle_bytes)}")
+            ipc_handle_b64 = base64.b64encode(handle_bytes[:64]).decode("utf-8")
+            torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr)
+            element_size = torch_tensor.element_size()
+            numel = int(torch_tensor.numel())
+            tensor_storage[tensor_id] = {
+                "mode": "cuda",
+                "torch_tensor": torch_tensor,
+                "cupy": cp_arr,
+                "shape": list(cp_arr.shape),
+                "dtype": str(torch_tensor.dtype),
+                "device": f"cuda:{cuda_device}",
+                "sample_rate": sample_rate,
+                "original_filename": wav_file.filename,
+                "ipc_handle": ipc_handle_b64,
+                "data_ptr": ptr,
+                "element_size": element_size,
+                "numel": numel,
+                "nbytes": element_size * numel,
+            }
+            device_label = f"cuda:{cuda_device}"
         else:
-            try:
-                handle_bytes = np.asarray(handle_obj, dtype=np.uint8).tobytes()
-            except Exception:
-                raise HTTPException(status_code=500, detail="Unsupported IPC handle type")
-        if len(handle_bytes) < 64:
-            raise HTTPException(status_code=500, detail=f"Invalid IPC handle size: {len(handle_bytes)}")
-        ipc_handle_b64 = base64.b64encode(handle_bytes[:64]).decode('utf-8')
-        
-        tensor_storage[tensor_id] = {
-            "cupy": cp_arr,
-            "shape": list(cp_arr.shape),
-            "dtype": "torch.float32",
-            "device": f"cuda:{cuda_device}",
-            "sample_rate": sample_rate,
-            "original_filename": wav_file.filename,
-            "ipc_handle": ipc_handle_b64,
-            "data_ptr": ptr,
-            "element_size": 4,
-            "numel": int(cp_arr.size)
-        }
+            torch_tensor = torch.from_numpy(audio).to(torch.float32)
+            element_size = torch_tensor.element_size()
+            numel = int(torch_tensor.numel())
+            tensor_storage[tensor_id] = {
+                "mode": "cpu",
+                "torch_tensor": torch_tensor,
+                "shape": list(torch_tensor.shape),
+                "dtype": str(torch_tensor.dtype),
+                "device": "cpu",
+                "sample_rate": sample_rate,
+                "original_filename": wav_file.filename,
+                "element_size": element_size,
+                "numel": numel,
+                "nbytes": element_size * numel,
+            }
+            device_label = "cpu"
         
         os.unlink(tmp_file_path)
         
         return {
             "tensor_id": tensor_id,
-            "shape": list(cp_arr.shape),
-            "dtype": "torch.float32",
-            "device": f"cuda:{cuda_device}",
+            "shape": list(tensor_storage[tensor_id]["shape"]),
+            "dtype": tensor_storage[tensor_id]["dtype"],
+            "device": device_label,
             "sample_rate": sample_rate,
-            "message": f"Tensor loaded successfully on cuda:{cuda_device}"
+            "message": f"Tensor loaded successfully on {device_label}"
         }
         
     except Exception as e:
@@ -111,7 +132,7 @@ async def create_tensor(
 
 
 class TensorArrayPayload(BaseModel):
-    cuda_device: int
+    cuda_device: Optional[int] = 0
     sample_rate: int
     data_b64: str
     dtype: str = "float32"
@@ -120,13 +141,12 @@ class TensorArrayPayload(BaseModel):
 
 @app.post("/tensors/from-array")
 async def create_tensor_from_array(payload: TensorArrayPayload):
-    if not torch.cuda.is_available():
-        raise HTTPException(status_code=500, detail="CUDA is not available")
-
-    if payload.cuda_device >= torch.cuda.device_count() or payload.cuda_device < 0:
+    using_cuda = torch.cuda.is_available() and cp is not None
+    cuda_device = payload.cuda_device or 0
+    if using_cuda and (cuda_device >= torch.cuda.device_count() or cuda_device < 0):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid CUDA device {payload.cuda_device}. Available devices: 0-{torch.cuda.device_count()-1}"
+            detail=f"Invalid CUDA device {cuda_device}. Available devices: 0-{torch.cuda.device_count()-1}"
         )
 
     try:
@@ -135,38 +155,66 @@ async def create_tensor_from_array(payload: TensorArrayPayload):
         np_array = np.frombuffer(raw, dtype=np_dtype)
         if payload.shape:
             np_array = np_array.reshape(tuple(payload.shape))
-        # Use shared memory mapping for TRUE zero-copy GPU tensor sharing
-        cp.cuda.Device(payload.cuda_device).use()
-        cp_arr = cp.asarray(np_array, dtype=cp.float32)
-        
-        # Convert to PyTorch tensor using modern DLPack protocol (no toDlpack())
-        torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr)
-        
-        # Create shared memory identifier using data pointer
-        data_ptr = int(torch_tensor.data_ptr())
-        
+
         tensor_id = str(uuid.uuid4())
-        tensor_storage[tensor_id] = {
-            "torch_tensor": torch_tensor,  # Keep reference to prevent garbage collection
-            "cupy": cp_arr,
-            "shape": list(torch_tensor.shape),
-            "dtype": "torch.float32", 
-            "device": f"cuda:{payload.cuda_device}",
-            "sample_rate": payload.sample_rate,
-            "original_filename": None,
-            "data_ptr": data_ptr,
-            "element_size": 4,
-            "numel": int(torch_tensor.numel()),
-            "nbytes": int(torch_tensor.numel() * 4)
-        }
+        if using_cuda:
+            cp.cuda.Device(cuda_device).use()
+            cp_arr = cp.asarray(np_array, dtype=cp.float32)
+            torch_tensor = torch.utils.dlpack.from_dlpack(cp_arr)
+            data_ptr = int(torch_tensor.data_ptr())
+            handle_obj = cp.cuda.runtime.ipcGetMemHandle(data_ptr)
+            if isinstance(handle_obj, (bytes, bytearray)):
+                handle_bytes = bytes(handle_obj)
+            elif hasattr(handle_obj, "tobytes"):
+                handle_bytes = handle_obj.tobytes()
+            else:
+                handle_bytes = np.asarray(handle_obj, dtype=np.uint8).tobytes()
+            if len(handle_bytes) < 64:
+                raise HTTPException(status_code=500, detail=f"Invalid IPC handle size: {len(handle_bytes)}")
+            ipc_handle_b64 = base64.b64encode(handle_bytes[:64]).decode("utf-8")
+            element_size = torch_tensor.element_size()
+            numel = int(torch_tensor.numel())
+            tensor_storage[tensor_id] = {
+                "mode": "cuda",
+                "torch_tensor": torch_tensor,
+                "cupy": cp_arr,
+                "shape": list(torch_tensor.shape),
+                "dtype": str(torch_tensor.dtype),
+                "device": f"cuda:{cuda_device}",
+                "sample_rate": payload.sample_rate,
+                "original_filename": None,
+                "ipc_handle": ipc_handle_b64,
+                "data_ptr": data_ptr,
+                "element_size": element_size,
+                "numel": numel,
+                "nbytes": element_size * numel,
+            }
+            device_label = f"cuda:{cuda_device}"
+        else:
+            torch_tensor = torch.from_numpy(np_array.copy()).to(torch.float32)
+            element_size = torch_tensor.element_size()
+            numel = int(torch_tensor.numel())
+            tensor_storage[tensor_id] = {
+                "mode": "cpu",
+                "torch_tensor": torch_tensor,
+                "shape": list(torch_tensor.shape),
+                "dtype": str(torch_tensor.dtype),
+                "device": "cpu",
+                "sample_rate": payload.sample_rate,
+                "original_filename": None,
+                "element_size": element_size,
+                "numel": numel,
+                "nbytes": element_size * numel,
+            }
+            device_label = "cpu"
 
         return {
             "tensor_id": tensor_id,
-            "shape": list(cp_arr.shape),
-            "dtype": "torch.float32",
-            "device": f"cuda:{payload.cuda_device}",
+            "shape": tensor_storage[tensor_id]["shape"],
+            "dtype": tensor_storage[tensor_id]["dtype"],
+            "device": device_label,
             "sample_rate": payload.sample_rate,
-            "message": f"Tensor loaded successfully on cuda:{payload.cuda_device}"
+            "message": f"Tensor loaded successfully on {device_label}",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create tensor from array: {str(e)}")
@@ -178,6 +226,7 @@ async def get_tensor_info(tensor_id: str):
     
     info = tensor_storage[tensor_id].copy()
     info.pop("cupy", None)
+    info.pop("torch_tensor", None)
     info.pop("ipc_handle", None)
     return info
 
@@ -187,18 +236,35 @@ async def get_tensor_handle(tensor_id: str):
         raise HTTPException(status_code=404, detail="Tensor not found")
     
     tensor_info = tensor_storage[tensor_id]
-    
+    if tensor_info.get("mode") == "cuda":
+        return {
+            "tensor_id": tensor_id,
+            "shared_memory": True,
+            "shape": tensor_info["shape"],
+            "dtype": tensor_info["dtype"],
+            "device": tensor_info["device"],
+            "ipc_handle": tensor_info["ipc_handle"],
+            "data_ptr": tensor_info["data_ptr"],
+            "element_size": tensor_info["element_size"],
+            "numel": tensor_info["numel"],
+            "nbytes": tensor_info["nbytes"],
+            "sample_rate": tensor_info["sample_rate"],
+        }
+
+    cpu_tensor = tensor_info["torch_tensor"]
+    data_bytes = cpu_tensor.numpy().tobytes()
+    data_b64 = base64.b64encode(data_bytes).decode("utf-8")
     return {
         "tensor_id": tensor_id,
-        "shared_memory": True,  # Flag indicating shared memory access
+        "shared_memory": False,
         "shape": tensor_info["shape"],
         "dtype": tensor_info["dtype"],
         "device": tensor_info["device"],
-        "data_ptr": tensor_info["data_ptr"],
-        "element_size": tensor_info["element_size"],
-        "numel": tensor_info["numel"],
-        "nbytes": tensor_info["nbytes"],
-        "sample_rate": tensor_info["sample_rate"]
+        "element_size": cpu_tensor.element_size(),
+        "numel": cpu_tensor.numel(),
+        "nbytes": cpu_tensor.element_size() * cpu_tensor.numel(),
+        "sample_rate": tensor_info["sample_rate"],
+        "data_b64": data_b64,
     }
 
 @app.get("/tensors/{tensor_id}/direct")
@@ -210,13 +276,12 @@ async def get_direct_tensor(tensor_id: str):
     tensor_info = tensor_storage[tensor_id]
     torch_tensor = tensor_info["torch_tensor"]
     
-    print(f"DEBUG: Providing DIRECT zero-copy access to GPU tensor {tensor_id}")
+    print(f"DEBUG: Providing DIRECT access to tensor {tensor_id}")
     print(f"DEBUG: Tensor shape: {torch_tensor.shape}, dtype: {torch_tensor.dtype}, device: {torch_tensor.device}")
-    print(f"DEBUG: This is TRUE zero-copy - same physical GPU memory!")
     
     return {
         "tensor_id": tensor_id,
-        "tensor": torch_tensor,  # Direct tensor reference - TRUE zero-copy!
+        "tensor": torch_tensor,
         "shape": list(torch_tensor.shape),
         "dtype": str(torch_tensor.dtype),
         "device": str(torch_tensor.device),
@@ -252,6 +317,7 @@ async def list_tensors():
     for tensor_id, info in tensor_storage.items():
         tensor_info = info.copy()
         tensor_info.pop("cupy", None)
+        tensor_info.pop("torch_tensor", None)
         tensor_info.pop("ipc_handle", None)
         tensor_info["tensor_id"] = tensor_id
         tensor_list.append(tensor_info)

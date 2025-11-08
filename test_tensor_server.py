@@ -7,6 +7,13 @@ import io
 from fastapi.testclient import TestClient
 from tensor_server import app
 
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - cupy may be unavailable
+    cp = None
+
+HAS_CUDA_IPC = torch.cuda.is_available() and cp is not None
+
 client = TestClient(app)
 
 @pytest.fixture
@@ -67,7 +74,6 @@ class TestTensorServer:
         assert "count" in data
         assert isinstance(data["tensors"], list)
     
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_create_tensor_success(self, sample_wav_bytes):
         files = {"wav_file": ("test.wav", sample_wav_bytes, "audio/wav")}
         data = {"cuda_device": 0}
@@ -81,7 +87,10 @@ class TestTensorServer:
         assert "dtype" in result
         assert "device" in result
         assert "sample_rate" in result
-        assert "cuda:0" in result["device"]
+        if HAS_CUDA_IPC:
+            assert result["device"].startswith("cuda:")
+        else:
+            assert result["device"] == "cpu"
         
         tensor_id = result["tensor_id"]
         
@@ -93,8 +102,12 @@ class TestTensorServer:
         data = {"cuda_device": 999}
         
         response = client.post("/tensors", files=files, data=data)
-        assert response.status_code == 400
-        assert "Invalid CUDA device" in response.json()["detail"]
+        if HAS_CUDA_IPC:
+            assert response.status_code == 400
+            assert "Invalid CUDA device" in response.json()["detail"]
+        else:
+            # In CPU mode the request succeeds regardless of CUDA device id.
+            assert response.status_code == 200
     
     def test_create_tensor_invalid_file_type(self):
         fake_file = b"not a wav file"
@@ -105,7 +118,6 @@ class TestTensorServer:
         assert response.status_code == 400
         assert "Only WAV files are supported" in response.json()["detail"]
     
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_tensor_lifecycle(self, sample_wav_bytes):
         files = {"wav_file": ("test.wav", sample_wav_bytes, "audio/wav")}
         data = {"cuda_device": 0}
@@ -127,13 +139,18 @@ class TestTensorServer:
         handle_response = client.get(f"/tensors/{tensor_id}/handle")
         assert handle_response.status_code == 200
         handle_result = handle_response.json()
-        assert "ipc_handle" in handle_result
-        assert "tensor_id" in handle_result
+        if HAS_CUDA_IPC:
+            assert "ipc_handle" in handle_result
+        else:
+            assert "data_b64" in handle_result
         assert handle_result["tensor_id"] == tensor_id
-        assert "data_ptr" in handle_result
         assert "element_size" in handle_result
         assert "numel" in handle_result
-        assert isinstance(handle_result["ipc_handle"], str)
+        if HAS_CUDA_IPC:
+            assert "data_ptr" in handle_result
+        else:
+            decoded = base64.b64decode(handle_result["data_b64"])
+            assert len(decoded) == handle_result["nbytes"]
         
         list_response = client.get("/tensors")
         assert list_response.status_code == 200
@@ -167,7 +184,7 @@ class TestTensorServer:
         assert response.status_code == 404
         assert "Tensor not found" in response.json()["detail"]
     
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not HAS_CUDA_IPC, reason="CUDA not available")
     def test_multiple_tensors_different_devices(self, sample_wav_bytes):
         if torch.cuda.device_count() < 2:
             pytest.skip("Need at least 2 CUDA devices for this test")
@@ -194,7 +211,7 @@ class TestTensorServer:
 
 class TestTensorServerIntegration:
     
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not HAS_CUDA_IPC, reason="CUDA not available")
     def test_wav_file_loading_and_tensor_properties(self, sample_wav_bytes):
         files = {"wav_file": ("sine_wave.wav", sample_wav_bytes, "audio/wav")}
         data = {"cuda_device": 0}
