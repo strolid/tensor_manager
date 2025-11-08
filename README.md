@@ -112,7 +112,7 @@ Use the `TensorClient` class for easy integration:
 ```python
 from tensor_client import TensorClient
 
-client = TensorClient(host="localhost", port=8000)
+client = TensorClient()
 
 # Upload WAV file
 tensor_id = client.upload_wav_file("audio.wav", cuda_device=0)
