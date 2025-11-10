@@ -5,11 +5,8 @@ from __future__ import annotations
 import base64
 import logging
 import os
-import threading
 import time
-import weakref
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import torch
@@ -21,9 +18,9 @@ except ImportError:  # pragma: no cover - cupy may be unavailable on CPU-only sy
 
 import numpy as np
 
-from tensor_manager.loader import (
-    LoadedTensor,
+from .loader import (
     DEFAULT_SAMPLE_RATE,
+    LoadedTensor,
     load_tensor_from_vcon,
     normalize_vcon,
 )
@@ -62,38 +59,20 @@ def _normalise_device(device: Optional[Any]) -> str:
     return device
 
 
-@dataclass
-class _CacheEntry:
-    tensor_id: Optional[str]
-    device: str
-    source: str  # 'remote' or 'local'
-    sample_rate: Optional[int]
-    tensor_ref: weakref.ReferenceType
-    last_access: float
-    cleanup_timer: Optional[threading.Timer] = None
-
-    def tensor(self) -> Optional[torch.Tensor]:
-        return self.tensor_ref() if self.tensor_ref else None
-
-
 class TensorClient:
-    """Client for the tensor manager with automatic fallback and cache handling."""
+    """Lightweight tensor manager client with optional remote acceleration."""
 
     _SERVER_CHECK_INTERVAL = 30.0
-    _EVICTION_DELAY = 10.0  # seconds after deref before deletion
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8003):
         self.host = host
         self.port = port
         self.server_url = f"http://{self.host}:{self.port}"
-        self._lock = threading.RLock()
-        self._cache: Dict[Tuple[str, str], _CacheEntry] = {}
-        self._tensor_keys: Dict[int, Tuple[str, str]] = {}
         self._server_state = {"available": None, "checked_at": 0.0}
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # HTTP helpers
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.server_url}{path}"
@@ -125,13 +104,16 @@ class TensorClient:
         return ok
 
     def _mark_server_unavailable(self) -> None:
-        with self._lock:
-            self._server_state["available"] = False
-            self._server_state["checked_at"] = time.time()
+        self._server_state["available"] = False
+        self._server_state["checked_at"] = time.time()
 
-    # --------------------------------------------------------------------- #
+    def is_server_available(self) -> bool:
+        """Public helper so callers can check availability without loading tensors."""
+        return self._ensure_server_available()
+
+    # ------------------------------------------------------------------ #
     # Core HTTP API wrappers
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def get_tensor_handle(self, tensor_id: str) -> dict:
         response = self._request("GET", f"/tensors/{tensor_id}/handle")
@@ -266,78 +248,9 @@ class TensorClient:
             raise RuntimeError(f"Failed to list tensors: {response.text}")
         return response.json()["tensors"]
 
-    # --------------------------------------------------------------------- #
-    # Cache + tensor lifecycle
-    # --------------------------------------------------------------------- #
-
-    def _register_tensor(
-        self,
-        key: Tuple[str, str],
-        tensor: torch.Tensor,
-        source: str,
-        tensor_id: Optional[str],
-        sample_rate: Optional[int],
-    ) -> torch.Tensor:
-        weak_tensor = weakref.ref(tensor)
-        entry = _CacheEntry(
-            tensor_id=tensor_id,
-            device=key[1],
-            source=source,
-            sample_rate=sample_rate,
-            tensor_ref=weak_tensor,
-            last_access=time.time(),
-        )
-
-        with self._lock:
-            existing = self._cache.get(key)
-            if existing and existing.cleanup_timer:
-                existing.cleanup_timer.cancel()
-            self._cache[key] = entry
-            self._tensor_keys[id(tensor)] = key
-
-        weak_self = weakref.ref(self)
-
-        def _finalizer():
-            parent = weak_self()
-            if parent is not None:
-                parent._mark_deref(key)
-
-        weakref.finalize(tensor, _finalizer)
-        return tensor
-
-    def _mark_deref(self, key: Tuple[str, str]) -> None:
-        with self._lock:
-            entry = self._cache.get(key)
-            if not entry:
-                return
-            if entry.cleanup_timer:
-                return
-            timer = threading.Timer(self._EVICTION_DELAY, self._evict_entry, args=[key])
-            timer.daemon = True
-            entry.cleanup_timer = timer
-            timer.start()
-
-    def _evict_entry(self, key: Tuple[str, str]) -> None:
-        entry: Optional[_CacheEntry]
-        with self._lock:
-            entry = self._cache.pop(key, None)
-            if entry:
-                to_remove = [tid for tid, mapped_key in self._tensor_keys.items() if mapped_key == key]
-                for tid in to_remove:
-                    self._tensor_keys.pop(tid, None)
-
-        if not entry:
-            return
-
-        if entry.source == "remote" and entry.tensor_id:
-            try:
-                self.delete_tensor(entry.tensor_id)
-            except Exception as exc:
-                logger.debug("Failed to delete remote tensor %s: %s", entry.tensor_id, exc)
-
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # High-level operations
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def get_or_lookup_tensor_by_vcon(self, vcon: Any, device: Optional[Any] = None) -> torch.Tensor:
         device_str = _normalise_device(device)
@@ -346,36 +259,50 @@ class TensorClient:
         if not vcon_uuid:
             raise ValueError("vCon is missing a uuid")
 
-        key = (vcon_uuid, device_str)
+        if device_str.startswith("cuda"):
+            if self._ensure_server_available():
+                tensor = self._get_tensor_remote(vcon_dict, assign_back, device_str)
+                if assign_back:
+                    assign_back(vcon_dict)
+                return tensor
+            logger.debug("Tensor manager unavailable; falling back to local tensor for %s", vcon_uuid)
 
-        with self._lock:
-            cached = self._cache.get(key)
-            if cached:
-                tensor = cached.tensor()
-                if tensor is not None:
-                    cached.last_access = time.time()
-                    return tensor
-
-        if device_str.startswith("cuda") and self._ensure_server_available():
-            return self._get_tensor_remote(vcon_dict, assign_back, key)
-
-        return self._get_tensor_local(vcon_dict, assign_back, key)
+        tensor = self._get_tensor_local(vcon_dict, assign_back, device_str)
+        if assign_back:
+            assign_back(vcon_dict)
+        return tensor
 
     def vcon_to_tensor(self, vcon: Any, device: Optional[Any] = None) -> torch.Tensor:
-        """Compatibility alias for callers that expect the transitional name."""
         return self.get_or_lookup_tensor_by_vcon(vcon, device=device)
 
-    # Remote path --------------------------------------------------------- #
+    def ensure_remote_tensor(self, vcon: Any, device: Optional[Any] = None) -> Optional[torch.Tensor]:
+        """Materialise the vCon's audio tensor on the tensor-manager server if available."""
+        if not self._ensure_server_available():
+            return None
+        device_str = _normalise_device(device or "cuda:0")
+        vcon_dict, assign_back = normalize_vcon(vcon)
+        tensor = self._get_tensor_remote(vcon_dict, assign_back, device_str)
+        if assign_back:
+            assign_back(vcon_dict)
+        return tensor
+
+    def unload_remote_tensor(self, vcon: Any) -> int:
+        """Remove any GPU tensors associated with the vCon from the tensor manager."""
+        if not self._ensure_server_available():
+            return 0
+        return self.delete_tensor_by_vcon(vcon)
+
+    # ------------------------------------------------------------------ #
+    # Remote helpers
+    # ------------------------------------------------------------------ #
 
     def _get_tensor_remote(
         self,
         vcon_dict: Dict[str, Any],
         assign_back: Optional[callable],
-        key: Tuple[str, str],
+        device_str: str,
     ) -> torch.Tensor:
-        device_str = key[1]
         dialogs: List[Dict[str, Any]] = vcon_dict.get("dialog", []) or []
-
         tensor_entry, entry_index = self._find_existing_tensor_entry(dialogs, device_str)
         tensor_id: Optional[str] = None
 
@@ -384,21 +311,15 @@ class TensorClient:
             if tensor_id:
                 try:
                     tensor = self.access_shared_tensor(tensor_id)
+                    if str(tensor.device) != device_str:
+                        tensor = tensor.to(device_str)
+                    return tensor
                 except Exception as exc:
                     logger.debug("Existing tensor %s unavailable, removing entry: %s", tensor_id, exc)
                     dialogs.pop(entry_index)
                     if assign_back:
                         assign_back(vcon_dict)
-                    tensor_id = None
-                else:
-                    tensor = self._register_tensor(key, tensor, "remote", tensor_id, tensor_entry.get("sample_rate"))
-                    tensor_entry["device"] = str(tensor.device)
-                    tensor_entry.setdefault("shape", list(tensor.shape))
-                    if assign_back:
-                        assign_back(vcon_dict)
-                    return tensor
 
-        # No suitable remote tensor cached; load locally and upload.
         loaded = load_tensor_from_vcon(vcon_dict, device="cpu")
         tensor_cpu = loaded.tensor
         sample_rate = loaded.sample_rate or DEFAULT_SAMPLE_RATE
@@ -410,10 +331,11 @@ class TensorClient:
         except Exception as exc:
             logger.debug("Remote tensor upload/access failed, falling back to local: %s", exc)
             self._mark_server_unavailable()
-            return self._get_tensor_local(vcon_dict, assign_back, key)
+            if device_str.startswith("cuda") and torch.cuda.is_available():
+                return tensor_cpu.to(device_str)
+            return tensor_cpu
 
-        remote_device = str(remote_tensor.device)
-        if remote_device != device_str:
+        if str(remote_tensor.device) != device_str:
             remote_tensor = remote_tensor.to(device_str)
 
         entry = {
@@ -425,10 +347,7 @@ class TensorClient:
         }
         dialogs.append(entry)
         vcon_dict["dialog"] = dialogs
-        if assign_back:
-            assign_back(vcon_dict)
-
-        return self._register_tensor(key, remote_tensor, "remote", tensor_id, sample_rate)
+        return remote_tensor
 
     def _find_existing_tensor_entry(
         self, dialogs: List[Dict[str, Any]], device_str: str
@@ -449,49 +368,36 @@ class TensorClient:
                 fallback_entry, fallback_idx = entry, idx
         return fallback_entry, fallback_idx
 
-    # Local path ---------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Local helpers
+    # ------------------------------------------------------------------ #
 
     def _get_tensor_local(
         self,
         vcon_dict: Dict[str, Any],
         assign_back: Optional[callable],
-        key: Tuple[str, str],
+        device_str: str,
     ) -> torch.Tensor:
-        device_str = key[1]
-        loaded: LoadedTensor = load_tensor_from_vcon(vcon_dict, device=device_str if device_str != "cpu" else None)
+        loaded: LoadedTensor = load_tensor_from_vcon(
+            vcon_dict, device=device_str if device_str != "cpu" else None
+        )
         tensor = loaded.tensor
-        return self._register_tensor(key, tensor, "local", None, loaded.sample_rate)
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            tensor = tensor.to(device_str)
+        return tensor
 
-    # --------------------------------------------------------------------- #
-    # Dereference helpers
-    # --------------------------------------------------------------------- #
-
-    def deref_tensor_by_vcon(self, vcon: Any, device: Optional[Any] = None) -> None:
-        device_str = _normalise_device(device)
-        vcon_dict, _ = normalize_vcon(vcon)
-        vcon_uuid = vcon_dict.get("uuid")
-        if not vcon_uuid:
-            return
-        key = (vcon_uuid, device_str)
-        self._mark_deref(key)
-
-    def deref_tensor(self, tensor: torch.Tensor) -> None:
-        key = self._tensor_keys.get(id(tensor))
-        if key:
-            self._mark_deref(key)
-
-    # --------------------------------------------------------------------- #
-    # Legacy cleanup helpers retained for compatibility
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Removal helpers
+    # ------------------------------------------------------------------ #
 
     def delete_tensor_by_vcon(self, vcon: Any) -> int:
         vcon_dict, assign_back = normalize_vcon(vcon)
         dialogs: List[Dict[str, Any]] = vcon_dict.get("dialog", []) or []
         deleted = 0
-        new_dialogs: List[Dict[str, Any]] = []
+        kept: List[Dict[str, Any]] = []
 
         for entry in dialogs:
-            if entry.get("type") in {"tensor", "tensor_ref", "gpu-entire", "gpu_tensor"}:
+            if entry.get("type") == "tensor":
                 tensor_id = _parse_tensor_ref(entry.get("tensor_ref"))
                 if tensor_id:
                     try:
@@ -500,15 +406,16 @@ class TensorClient:
                     except Exception:
                         pass
                 continue
-            new_dialogs.append(entry)
+            kept.append(entry)
 
         if deleted:
-            vcon_dict["dialog"] = new_dialogs
+            vcon_dict["dialog"] = kept
             if assign_back:
                 assign_back(vcon_dict)
         return deleted
 
     def remove_loaded_tensor(self, vcon: Any) -> int:
+        """Remove any tensor references from a vCon without contacting the server."""
         vcon_dict, assign_back = normalize_vcon(vcon)
         dialogs: List[Dict[str, Any]] = vcon_dict.get("dialog", []) or []
         kept: List[Dict[str, Any]] = []

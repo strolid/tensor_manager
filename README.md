@@ -24,7 +24,7 @@ source .venv/bin/activate
 ### Start the Server
 
 ```bash
-python tensor_server.py
+python -m tensor_manager.tensor_server
 ```
 
 The server will run on `http://localhost:8000`
@@ -110,7 +110,7 @@ curl http://localhost:8000/cuda/info
 Use the `TensorClient` class for easy integration:
 
 ```python
-from tensor_client import TensorClient
+from tensor_manager.tensor_client import TensorClient
 
 client = TensorClient()
 
@@ -140,7 +140,7 @@ pytest test_tensor_server.py -v
 python usage_example.py
 
 # Client library demonstration  
-python tensor_client.py
+python -m tensor_manager.tensor_client
 ```
 
 ## How It Works

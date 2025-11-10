@@ -1,11 +1,17 @@
+import base64
 import pytest
 import torch
 import numpy as np
-from pathlib import Path
 import tempfile
 import io
 from fastapi.testclient import TestClient
-from tensor_server import app
+from tensor_manager.tensor_server import app
+import importlib
+
+from tensor_manager.tensor_client import TensorClient
+
+load_tensor_module = importlib.import_module("tensor_manager.load_tensor")
+unload_tensor_module = importlib.import_module("tensor_manager.unload_tensor")
 
 try:
     import cupy as cp
@@ -241,6 +247,80 @@ class TestTensorServerIntegration:
         assert len(handle_result["shape"]) == 1
         
         client.delete(f"/tensors/{tensor_id}")
+
+
+class DummyVcon:
+    def __init__(self, uuid: str):
+        self.uuid = uuid
+        self.dialog = []
+
+    def to_dict(self):
+        return {"uuid": self.uuid, "dialog": self.dialog}
+
+
+class DummyRedis:
+    def __init__(self, vcon: DummyVcon):
+        self._vcon = vcon
+        self.stored = False
+
+    def get_vcon(self, uuid: str):
+        return self._vcon if self._vcon.uuid == uuid else None
+
+    def store_vcon(self, vcon):
+        self.stored = True
+
+
+def test_load_tensor_no_server(monkeypatch):
+    monkeypatch.setattr(TensorClient, "is_server_available", lambda self: False)
+    result = load_tensor_module.run("vcon-123", "load_tensor")
+    assert result == "vcon-123"
+
+
+def test_unload_tensor_no_server(monkeypatch):
+    monkeypatch.setattr(TensorClient, "is_server_available", lambda self: False)
+    result = unload_tensor_module.run("vcon-123", "unload_tensor")
+    assert result == "vcon-123"
+
+
+def test_load_tensor_invokes_client(monkeypatch):
+    vcon = DummyVcon("vcon-123")
+    dummy_redis = DummyRedis(vcon)
+
+    monkeypatch.setattr(TensorClient, "is_server_available", lambda self: True)
+    called = {}
+
+    def fake_ensure(self, vcon_obj, device="cuda:0"):
+        called["device"] = device
+        called["uuid"] = vcon_obj.uuid
+        return torch.zeros(1)
+
+    monkeypatch.setattr(TensorClient, "ensure_remote_tensor", fake_ensure, raising=False)
+    monkeypatch.setattr(TensorClient, "__init__", lambda self: None)
+    monkeypatch.setattr(load_tensor_module, "VconRedis", lambda: dummy_redis)
+    result = load_tensor_module.run("vcon-123", "load_tensor", {"device": "cuda:1"})
+    assert result == "vcon-123"
+    assert called == {"device": "cuda:1", "uuid": "vcon-123"}
+    assert dummy_redis.stored is True
+
+
+def test_unload_tensor_invokes_client(monkeypatch):
+    vcon = DummyVcon("vcon-456")
+    dummy_redis = DummyRedis(vcon)
+
+    monkeypatch.setattr(TensorClient, "is_server_available", lambda self: True)
+    called = {}
+
+    def fake_unload(self, vcon_obj):
+        called["uuid"] = vcon_obj.uuid
+        return 1
+
+    monkeypatch.setattr(TensorClient, "unload_remote_tensor", fake_unload, raising=False)
+    monkeypatch.setattr(TensorClient, "__init__", lambda self: None)
+    monkeypatch.setattr(unload_tensor_module, "VconRedis", lambda: dummy_redis)
+    result = unload_tensor_module.run("vcon-456", "unload_tensor")
+    assert result == "vcon-456"
+    assert called == {"uuid": "vcon-456"}
+    assert dummy_redis.stored is True
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

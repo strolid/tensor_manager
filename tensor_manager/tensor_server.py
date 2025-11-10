@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 import torchaudio
+import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -51,8 +52,16 @@ async def create_tensor(
             content = await wav_file.read()
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
-        waveform, sample_rate = torchaudio.load(tmp_file_path)
-        audio = waveform.squeeze(0).contiguous().numpy()
+        try:
+            waveform, sample_rate = torchaudio.load(tmp_file_path)
+            audio = waveform.squeeze(0).contiguous().numpy()
+        except (ImportError, RuntimeError) as err:
+            if "torchcodec" not in str(err).lower():
+                raise
+            audio, sample_rate = sf.read(tmp_file_path, dtype="float32", always_2d=False)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio = np.asarray(audio, dtype=np.float32)
 
         if using_cuda:
             cp.cuda.Device(cuda_device).use()
