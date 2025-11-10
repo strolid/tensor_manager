@@ -18,7 +18,7 @@ uvicorn = {extras = ["standard"], version = "^0.38.0"}
 python-multipart = "^0.0.20"
 pytest = "^8.4.2"
 httpx = "^0.28.1"
-numpy = "^2.3.4"
+numpy = "^1.26.4"
 requests = "^2.32.3"
 soundfile = "^0.13.1"
 strolidlib = {git = "git@github.com:strolid/strolidlib.git", branch = "main"}
